@@ -1,0 +1,105 @@
+#!/bin/bash
+# vpnctl: Touch ID-gated wrapper around Check Point Endpoint Security VPN (trac).
+# Installed root:wheel 0755 at /usr/local/sbin/vpnctl and run via sudo.
+# Site and username come from the client's config: the active site in `trac info`
+# and the username it has for that site.
+#
+#   sudo vpnctl set-password [user@site]   Touch ID, then type the password (stored in System keychain).
+#                                          Without an argument, uses the active site and its username.
+#   sudo vpnctl up                         Touch ID, then connect to the active site
+#   sudo vpnctl down                       disconnect (no approval)
+#   sudo vpnctl status                     connection info (no approval)
+set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+TRAC="/Library/Application Support/Checkpoint/Endpoint Connect/trac"   # verify this path
+KC=/Library/Keychains/System.keychain
+KIND=vpnctl   # keychain "kind" attribute on every item vpnctl saves; uninstall --purge uses it
+GATE=/usr/local/libexec/touchid-gate
+
+[[ $EUID -eq 0 && -n "${SUDO_UID:-}" ]] || { echo "run via sudo" >&2; exit 1; }
+
+touchid() {
+  # Runs the prompt in the invoking user's GUI session. The reason text is fixed
+  # here apart from the site/user, so a caller cannot make the prompt say something else.
+  launchctl asuser "$SUDO_UID" sudo -u "#$SUDO_UID" "$GATE" "$1" \
+    || { echo "Touch ID denied" >&2; exit 2; }
+}
+
+# Prints "<site> <user>" for the connection marked "active site: true" in `trac info`.
+# <user> is empty if that site doesn't use username-password. Prints nothing if no site is active.
+active_conf() {
+  { "$TRAC" info 2>/dev/null || true; } | awk '
+    function out() { if (act && site != "") { print site, user; done = 1 } }
+    /^Conn /                           { out(); if (done) exit
+                                         site = $2; sub(/:$/, "", site); user = ""; act = 0; next }
+    /active site: true/                { act = 1 }
+    /username-password with username / { u = $0; sub(/.*with username /, "", u)
+                                         sub(/[[:space:]]+$/, "", u); user = u }
+    END                                { if (!done) out() }'
+}
+
+# Site and username go into a `security -i` command line and the Touch ID prompt,
+# so each must be one plain token.
+token() { [[ "$1" =~ ^[^[:space:]\"\'\\]+$ ]]; }
+
+S= U=
+read -r S U < <(active_conf) || true
+
+case "${1:-}" in
+  set-password)
+    [[ -t 0 ]] || { echo "needs an interactive terminal" >&2; exit 1; }
+    if [[ -n "${2:-}" ]]; then
+      [[ "$2" == *@* ]] || { echo "expected user@site" >&2; exit 64; }
+      AU=${2%@*} AS=${2##*@}
+      [[ -n "$AU" && -n "$AS" ]] || { echo "expected user@site" >&2; exit 64; }
+      if [[ "$AU@$AS" != "$U@$S" ]]; then
+        echo "warning: the client's active config is '${U:-no username}@${S:-no site}'; 'vpnctl up'" >&2
+        echo "         uses that and won't use this password until the client matches '$AU@$AS'." >&2
+      fi
+      U=$AU S=$AS
+    else
+      [[ -n "$S" ]] || { echo "no active site in 'trac info'; pass user@site" >&2; exit 1; }
+      [[ -n "$U" ]] || { echo "$S has no username-password login configured; pass user@site" >&2; exit 1; }
+    fi
+    token "$U" && token "$S" || { echo "user and site must not contain spaces, quotes or backslashes" >&2; exit 1; }
+    touchid "Set VPN password for $U@$S"
+    read -rsp "VPN password for $U@$S: " PW; echo
+    read -rsp "Again: " PW2; echo
+    [[ -n "$PW" ]] || { echo "empty password" >&2; exit 1; }
+    [[ "$PW" == "$PW2" ]] || { echo "passwords differ" >&2; exit 1; }
+    # The password goes to security on stdin as hex (-X), so it is never in a
+    # command line and needs no quoting. printf is a bash builtin, so it adds no process.
+    HEX=$(printf %s "$PW" | xxd -p | tr -d '\n')
+    printf 'add-generic-password -U -s %s -a %s -D %s -X %s %s\n' "$S" "$U" "$KIND" "$HEX" "$KC" \
+      | security -i
+    [[ "$(security find-generic-password -s "$S" -a "$U" -w "$KC")" == "$PW" ]] \
+      || { echo "saving to $KC failed" >&2; exit 1; }
+    echo "saved for $U@$S"
+    ;;
+  up)
+    [[ -n "$S" ]] || { echo "no active site in 'trac info'" >&2; exit 1; }
+    [[ -n "$U" ]] || { echo "$S has no username-password login configured (see: trac info -s $S)" >&2; exit 1; }
+    token "$U" && token "$S" || { echo "unexpected site/user in trac config: '$U@$S'" >&2; exit 1; }
+    touchid "Connect VPN to $S"
+    PW=$(security find-generic-password -s "$S" -a "$U" -w "$KC" 2>/dev/null) \
+      || { echo "no saved password for $U@$S; run: sudo vpnctl set-password" >&2; exit 1; }
+    export PW TRAC SITE="$S" VPNUSER="$U"
+    # trac rejects -u without -p, so no credentials go on its command line. It prompts
+    # for the username and then the password; expect types both.
+    expect -c '
+      set timeout 60
+      spawn $env(TRAC) connect -s $env(SITE)
+      expect {
+        -re {sername:} { send -- "$env(VPNUSER)\r"; exp_continue }
+        -re {assword:} { log_user 0; send -- "$env(PW)\r"; log_user 1 }
+        timeout { puts stderr "vpnctl: no password prompt from trac"; exit 1 }
+        eof     { puts stderr "vpnctl: trac exited before asking for the password"; exit 1 }
+      }
+      expect eof
+      catch wait r; exit [lindex $r 3]'
+    ;;
+  down)   "$TRAC" disconnect ;;
+  status) if [[ -n "$S" ]]; then "$TRAC" info -s "$S"; else "$TRAC" info; fi ;;
+  *)      echo "usage: vpnctl set-password [user@site] | up | down | status" >&2; exit 64 ;;
+esac
